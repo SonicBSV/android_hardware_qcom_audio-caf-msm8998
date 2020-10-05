@@ -33,13 +33,14 @@
 #include <errno.h>
 #include <stdio.h>
 #include <expat.h>
-#include <cutils/log.h>
+#include <log/log.h>
 #include <cutils/str_parms.h>
 #include <audio_hw.h>
 #include "acdb.h"
 #include "platform_api.h"
 #include <platform.h>
 #include <math.h>
+#include <pthread.h>
 
 #ifdef DYNAMIC_LOG_ENABLED
 #include <log_xml_parser.h>
@@ -60,7 +61,9 @@ typedef enum {
     BACKEND_NAME,
     INTERFACE_NAME,
     CONFIG_PARAMS,
+    OPERATOR_SPECIFIC,
     GAIN_LEVEL_MAPPING,
+    APP_TYPE,
     ACDB_METAINFO_KEY,
     MICROPHONE_CHARACTERISTIC,
     SND_DEVICES,
@@ -68,9 +71,11 @@ typedef enum {
     INPUT_SND_DEVICE_TO_MIC_MAPPING,
     SND_DEV,
     MIC_INFO,
-    DEVICE_NAME,
     CUSTOM_MTMX_PARAMS,
     CUSTOM_MTMX_PARAM_COEFFS,
+    EXTERNAL_DEVICE_SPECIFIC,
+    CUSTOM_MTMX_IN_PARAMS,
+    CUSTOM_MTMX_PARAM_IN_CH_INFO,
 } section_t;
 
 typedef void (* section_process_fn)(const XML_Char **attr);
@@ -85,14 +90,18 @@ static void process_backend_name(const XML_Char **attr);
 static void process_interface_name(const XML_Char **attr);
 static void process_config_params(const XML_Char **attr);
 static void process_root(const XML_Char **attr);
+static void process_operator_specific(const XML_Char **attr);
 static void process_gain_db_to_level_map(const XML_Char **attr);
+static void process_app_type(const XML_Char **attr);
 static void process_acdb_metainfo_key(const XML_Char **attr);
 static void process_microphone_characteristic(const XML_Char **attr);
 static void process_snd_dev(const XML_Char **attr);
 static void process_mic_info(const XML_Char **attr);
-static void process_device_name(const XML_Char **attr);
 static void process_custom_mtmx_params(const XML_Char **attr);
 static void process_custom_mtmx_param_coeffs(const XML_Char **attr);
+static void process_external_dev(const XML_Char **attr);
+static void process_custom_mtmx_in_params(const XML_Char **attr);
+static void process_custom_mtmx_param_in_ch_info(const XML_Char **attr);
 
 static section_process_fn section_table[] = {
     [ROOT] = process_root,
@@ -104,14 +113,18 @@ static section_process_fn section_table[] = {
     [BACKEND_NAME] = process_backend_name,
     [INTERFACE_NAME] = process_interface_name,
     [CONFIG_PARAMS] = process_config_params,
+    [OPERATOR_SPECIFIC] = process_operator_specific,
+    [APP_TYPE] = process_app_type,
     [GAIN_LEVEL_MAPPING] = process_gain_db_to_level_map,
     [ACDB_METAINFO_KEY] = process_acdb_metainfo_key,
     [MICROPHONE_CHARACTERISTIC] = process_microphone_characteristic,
     [SND_DEV] = process_snd_dev,
     [MIC_INFO] = process_mic_info,
-    [DEVICE_NAME] = process_device_name,
     [CUSTOM_MTMX_PARAMS] = process_custom_mtmx_params,
     [CUSTOM_MTMX_PARAM_COEFFS] = process_custom_mtmx_param_coeffs,
+    [EXTERNAL_DEVICE_SPECIFIC] = process_external_dev,
+    [CUSTOM_MTMX_IN_PARAMS] = process_custom_mtmx_in_params,
+    [CUSTOM_MTMX_PARAM_IN_CH_INFO] = process_custom_mtmx_param_in_ch_info,
 };
 
 static section_t section;
@@ -123,6 +136,7 @@ struct platform_info {
 };
 
 static struct platform_info my_data;
+static pthread_mutex_t parser_lock = PTHREAD_MUTEX_INITIALIZER;
 
 
 struct audio_string_to_enum {
@@ -218,6 +232,7 @@ static bool find_enum_by_string(const struct audio_string_to_enum * table, const
 }
 
 static struct audio_custom_mtmx_params_info mtmx_params_info;
+static struct audio_custom_mtmx_in_params_info mtmx_in_params_info;
 
 /*
  * <audio_platform_info>
@@ -248,14 +263,18 @@ static struct audio_custom_mtmx_params_info mtmx_params_info;
  * </interface_names>
  * <config_params>
  *      <param key="snd_card_name" value="msm8994-tomtom-mtp-snd-card"/>
+ *      <param key="operator_info" value="tmus;aa;bb;cc"/>
+ *      <param key="operator_info" value="sprint;xx;yy;zz"/>
  *      ...
  *      ...
  * </config_params>
- * <device_names>
- * <device name="???" alias="???"/>
- * ...
- * ...
- * </device_names>
+ *
+ * <operator_specific>
+ *      <device name="???" operator="???" mixer_path="???" acdb_id="???"/>
+ *      ...
+ *      ...
+ * </operator_specific>
+ *
  * </audio_platform_info>
  */
 
@@ -372,6 +391,9 @@ static void process_gain_db_to_level_map(const XML_Char **attr)
     tbl_entry.amp = exp(tbl_entry.db * 0.115129f);
     tbl_entry.level = atoi(attr[3]);
 
+    //custome level should be > 0. Level 0 is fixed for default
+    CHECK(tbl_entry.level > 0);
+
     ALOGV("%s: amp [%f]  db [%f] level [%d]", __func__,
            tbl_entry.amp, tbl_entry.db, tbl_entry.level);
     platform_add_gain_level_mapping(&tbl_entry);
@@ -408,6 +430,75 @@ static void process_acdb_id(const XML_Char **attr)
               __func__, attr[1], atoi((char *)attr[3]));
         goto done;
     }
+
+done:
+    return;
+}
+
+static void process_operator_specific(const XML_Char **attr)
+{
+    snd_device_t snd_device = SND_DEVICE_NONE;
+
+    if (strcmp(attr[0], "name") != 0) {
+        ALOGE("%s: 'name' not found", __func__);
+        goto done;
+    }
+
+    snd_device = platform_get_snd_device_index((char *)attr[1]);
+    if (snd_device < 0) {
+        ALOGE("%s: Device %s in %s not found, no ACDB ID set!",
+              __func__, (char *)attr[3], PLATFORM_INFO_XML_PATH);
+        goto done;
+    }
+
+    if (strcmp(attr[2], "operator") != 0) {
+        ALOGE("%s: 'operator' not found", __func__);
+        goto done;
+    }
+
+    if (strcmp(attr[4], "mixer_path") != 0) {
+        ALOGE("%s: 'mixer_path' not found", __func__);
+        goto done;
+    }
+
+    if (strcmp(attr[6], "acdb_id") != 0) {
+        ALOGE("%s: 'acdb_id' not found", __func__);
+        goto done;
+    }
+
+    platform_add_operator_specific_device(snd_device, (char *)attr[3], (char *)attr[5], atoi((char *)attr[7]));
+
+done:
+    return;
+}
+
+static void process_external_dev(const XML_Char **attr)
+{
+    snd_device_t snd_device = SND_DEVICE_NONE;
+
+    if (strcmp(attr[0], "name") != 0) {
+        ALOGE("%s: 'name' not found", __func__);
+        goto done;
+    }
+
+    snd_device = platform_get_snd_device_index((char *)attr[1]);
+    if (snd_device < 0) {
+        ALOGE("%s: Device %s in %s not found, no ACDB ID set!",
+              __func__, (char *)attr[3], PLATFORM_INFO_XML_PATH);
+        goto done;
+    }
+
+    if (strcmp(attr[2], "usbid") != 0) {
+        ALOGE("%s: 'usbid' not found", __func__);
+        goto done;
+    }
+
+    if (strcmp(attr[4], "acdb_id") != 0) {
+        ALOGE("%s: 'acdb_id' not found", __func__);
+        goto done;
+    }
+
+    platform_add_external_specific_device(snd_device, (char *)attr[3], atoi((char *)attr[5]));
 
 done:
     return;
@@ -564,6 +655,41 @@ static void process_config_params(const XML_Char **attr)
     }
 
     str_parms_add_str(my_data.kvpairs, (char*)attr[1], (char*)attr[3]);
+    if (my_data.caller == PLATFORM)
+        platform_set_parameters(my_data.platform, my_data.kvpairs);
+done:
+    return;
+}
+
+static void process_app_type(const XML_Char **attr)
+{
+    if (strcmp(attr[0], "uc_type")) {
+        ALOGE("%s: uc_type not found", __func__);
+        goto done;
+    }
+
+    if (strcmp(attr[2], "mode")) {
+        ALOGE("%s: mode not found", __func__);
+        goto done;
+    }
+
+    if (strcmp(attr[4], "bit_width")) {
+        ALOGE("%s: bit_width not found", __func__);
+        goto done;
+    }
+
+    if (strcmp(attr[6], "id")) {
+        ALOGE("%s: id not found", __func__);
+        goto done;
+    }
+
+    if (strcmp(attr[8], "max_rate")) {
+        ALOGE("%s: max rate not found", __func__);
+        goto done;
+    }
+
+    platform_add_app_type(attr[1], attr[3], atoi(attr[5]), atoi(attr[7]),
+                          atoi(attr[9]));
 done:
     return;
 }
@@ -888,43 +1014,92 @@ done:
     return;
 }
 
-
-static void process_device_name(const XML_Char **attr)
+static void process_custom_mtmx_param_in_ch_info(const XML_Char **attr)
 {
-    int index;
+    uint32_t attr_idx = 0;
+    int32_t in_ch_idx = -1;
+    struct audio_custom_mtmx_in_params *mtmx_in_params = NULL;
 
-    if (strcmp(attr[0], "name") != 0) {
-        ALOGE("%s: 'name' not found, no alias set!", __func__);
-        goto done;
+    mtmx_in_params = platform_get_custom_mtmx_in_params((void *)my_data.platform,
+                                                  &mtmx_in_params_info);
+    if (mtmx_in_params == NULL) {
+        ALOGE("%s: mtmx in params with given param info, not found", __func__);
+        return;
     }
 
-    index = platform_get_snd_device_index((char *)attr[1]);
-    if (index < 0) {
-        ALOGE("%s: Device %s in platform info xml not found, no alias set!",
-              __func__, attr[1]);
-        goto done;
+    if (strcmp(attr[attr_idx++], "in_channel_index") != 0) {
+        ALOGE("%s: 'in_channel_index' not found", __func__);
+        return;
     }
 
-    if (strcmp(attr[2], "alias") != 0) {
-        ALOGE("%s: Device %s in platform info xml has no alias, no alias set!",
-              __func__, attr[1]);
-        goto done;
+    in_ch_idx = atoi((char *)attr[attr_idx++]);
+    if (in_ch_idx < 0 || in_ch_idx >= MAX_IN_CHANNELS) {
+        ALOGE("%s: invalid input channel index(%d)", __func__, in_ch_idx);
+        return;
     }
 
-    if (platform_set_snd_device_name(index, attr[3]) < 0) {
-        ALOGE("%s: Device %s, alias %s was not set!",
-              __func__, attr[1], attr[3]);
-        goto done;
+    if (strcmp(attr[attr_idx++], "channel_count") != 0) {
+        ALOGE("%s: 'channel_count' not found", __func__);
+        return;
+    }
+    mtmx_in_params->in_ch_info[in_ch_idx].ch_count = atoi((char *)attr[attr_idx++]);
+
+    if (strcmp(attr[attr_idx++], "device") != 0) {
+        ALOGE("%s: 'device' not found", __func__);
+        return;
+    }
+    strlcpy(mtmx_in_params->in_ch_info[in_ch_idx].device, attr[attr_idx++],
+            sizeof(mtmx_in_params->in_ch_info[in_ch_idx].device));
+
+    if (strcmp(attr[attr_idx++], "interface") != 0) {
+        ALOGE("%s: 'interface' not found", __func__);
+        return;
+    }
+    strlcpy(mtmx_in_params->in_ch_info[in_ch_idx].hw_interface, attr[attr_idx++],
+            sizeof(mtmx_in_params->in_ch_info[in_ch_idx].hw_interface));
+
+    if (!strncmp(mtmx_in_params->in_ch_info[in_ch_idx].device,
+                 ENUM_TO_STRING(AUDIO_DEVICE_IN_BUILTIN_MIC),
+                 sizeof(mtmx_in_params->in_ch_info[in_ch_idx].device)))
+        mtmx_in_params->mic_ch = mtmx_in_params->in_ch_info[in_ch_idx].ch_count;
+    else if (!strncmp(mtmx_in_params->in_ch_info[in_ch_idx].device,
+              ENUM_TO_STRING(AUDIO_DEVICE_IN_LOOPBACK),
+              sizeof(mtmx_in_params->in_ch_info[in_ch_idx].device)))
+        mtmx_in_params->ec_ref_ch = mtmx_in_params->in_ch_info[in_ch_idx].ch_count;
+
+    mtmx_in_params->ip_channels += mtmx_in_params->in_ch_info[in_ch_idx].ch_count;
+}
+
+static void process_custom_mtmx_in_params(const XML_Char **attr)
+{
+    int attr_idx = 0, i = 0;
+    char *context = NULL, *value = NULL;
+
+    if (strcmp(attr[attr_idx++], "usecase") != 0) {
+        ALOGE("%s: 'usecase' not found", __func__);
+        return;
+    }
+    /* Check if multi usecases are supported for this custom mtrx params */
+    value = strtok_r((char *)attr[attr_idx++], ",", &context);
+    while (value && (i < CUSTOM_MTRX_PARAMS_MAX_USECASE)) {
+        mtmx_in_params_info.usecase_id[i++] = platform_get_usecase_index(value);
+        value = strtok_r(NULL, ",", &context);
     }
 
-done:
-    return;
+    if (strcmp(attr[attr_idx++], "out_channel_count") != 0) {
+        ALOGE("%s: 'out_channel_count' not found", __func__);
+        return;
+    }
+    mtmx_in_params_info.op_channels = atoi((char *)attr[attr_idx++]);
+
+    platform_add_custom_mtmx_in_params((void *)my_data.platform, &mtmx_in_params_info);
+
 }
 
 static void process_custom_mtmx_param_coeffs(const XML_Char **attr)
 {
     uint32_t attr_idx = 0, out_ch_idx = -1, ch_coeff_count = 0;
-    uint32_t ip_channels = 0, op_channels = 0;
+    uint32_t ip_channels = 0, op_channels = 0, idx = 0;
     char *context = NULL, *ch_coeff_value = NULL;
     struct audio_custom_mtmx_params *mtmx_params = NULL;
 
@@ -944,7 +1119,7 @@ static void process_custom_mtmx_param_coeffs(const XML_Char **attr)
         return;
     }
     mtmx_params = platform_get_custom_mtmx_params((void *)my_data.platform,
-                                                  &mtmx_params_info);
+                                                  &mtmx_params_info, &idx);
     if (mtmx_params == NULL) {
         ALOGE("%s: mtmx params with given param info, not found", __func__);
         return;
@@ -952,7 +1127,7 @@ static void process_custom_mtmx_param_coeffs(const XML_Char **attr)
     ch_coeff_value = strtok_r((char *)attr[attr_idx++], " ", &context);
     ip_channels = mtmx_params->info.ip_channels;
     op_channels = mtmx_params->info.op_channels;
-    while(ch_coeff_value && ch_coeff_count < op_channels) {
+    while(ch_coeff_value && ch_coeff_count < ip_channels) {
         mtmx_params->coeffs[ip_channels * out_ch_idx + ch_coeff_count++]
                            = atoi(ch_coeff_value);
         ch_coeff_value = strtok_r(NULL, " ", &context);
@@ -964,7 +1139,10 @@ static void process_custom_mtmx_param_coeffs(const XML_Char **attr)
 
 static void process_custom_mtmx_params(const XML_Char **attr)
 {
-    int attr_idx = 0;
+    int attr_idx = 0, i = 0;
+    char *context = NULL, *value = NULL;
+
+    memset(&mtmx_params_info, 0, sizeof(mtmx_params_info));
 
     if (strcmp(attr[attr_idx++], "param_id") != 0) {
         ALOGE("%s: 'param_id' not found", __func__);
@@ -988,13 +1166,31 @@ static void process_custom_mtmx_params(const XML_Char **attr)
         ALOGE("%s: 'usecase' not found", __func__);
         return;
     }
-    mtmx_params_info.usecase_id = platform_get_usecase_index((char *)attr[attr_idx++]);
+
+    /* check if multi usecases are supported for this custom mtrx params */
+    value = strtok_r((char *)attr[attr_idx++], ",", &context);
+    while (value && (i < CUSTOM_MTRX_PARAMS_MAX_USECASE)) {
+        mtmx_params_info.usecase_id[i++] = platform_get_usecase_index(value);
+        value = strtok_r(NULL, ",", &context);
+    }
 
     if (strcmp(attr[attr_idx++], "snd_device") != 0) {
         ALOGE("%s: 'snd_device' not found", __func__);
         return;
     }
     mtmx_params_info.snd_device = platform_get_snd_device_index((char *)attr[attr_idx++]);
+
+    if ((attr[attr_idx] != NULL) && (strcmp(attr[attr_idx++], "fe_id") == 0)) {
+        i = 0;
+        value = strtok_r((char *)attr[attr_idx++], ",", &context);
+        while (value && (i < CUSTOM_MTRX_PARAMS_MAX_USECASE)) {
+            mtmx_params_info.fe_id[i++] = atoi(value);
+            value = strtok_r(NULL, ",", &context);
+        }
+
+        attr_idx++;
+    }
+
     platform_add_custom_mtmx_params((void *)my_data.platform, &mtmx_params_info);
 
 }
@@ -1027,22 +1223,24 @@ static void start_tag(void *userdata __unused, const XML_Char *tag_name,
             section = BACKEND_NAME;
         } else if (strcmp(tag_name, "config_params") == 0) {
             section = CONFIG_PARAMS;
+        } else if (strcmp(tag_name, "operator_specific") == 0) {
+            section = OPERATOR_SPECIFIC;
         } else if (strcmp(tag_name, "interface_names") == 0) {
             section = INTERFACE_NAME;
         } else if (strcmp(tag_name, "gain_db_to_level_mapping") == 0) {
             section = GAIN_LEVEL_MAPPING;
+        } else if (strcmp(tag_name, "app_types") == 0) {
+            section = APP_TYPE;
         } else if(strcmp(tag_name, "acdb_metainfo_key") == 0) {
             section = ACDB_METAINFO_KEY;
         } else if (strcmp(tag_name, "microphone_characteristics") == 0) {
             section = MICROPHONE_CHARACTERISTIC;
         } else if (strcmp(tag_name, "snd_devices") == 0) {
             section = SND_DEVICES;
-        } else if (strcmp(tag_name, "device_names") == 0) {
-            section = DEVICE_NAME;
         } else if (strcmp(tag_name, "device") == 0) {
             if ((section != ACDB) && (section != AEC) && (section != NS) &&
                 (section != BACKEND_NAME) && (section != BITWIDTH) &&
-                (section != INTERFACE_NAME)) {
+                (section != INTERFACE_NAME) && (section != OPERATOR_SPECIFIC)) {
                 ALOGE("device tag only supported for acdb/backend names/bitwitdh/interface names");
                 return;
             }
@@ -1086,6 +1284,22 @@ static void start_tag(void *userdata __unused, const XML_Char *tag_name,
                 return;
             }
             section = NS;
+        } else if (strcmp(tag_name, "gain_level_map") == 0) {
+            if (section != GAIN_LEVEL_MAPPING) {
+                ALOGE("gain_level_map tag only supported with GAIN_LEVEL_MAPPING section");
+                return;
+            }
+
+            section_process_fn fn = section_table[GAIN_LEVEL_MAPPING];
+            fn(attr);
+        } else if (!strcmp(tag_name, "app")) {
+            if (section != APP_TYPE) {
+                ALOGE("app tag only valid in section APP_TYPE");
+                return;
+            }
+
+            section_process_fn fn = section_table[APP_TYPE];
+            fn(attr);
         } else if (strcmp(tag_name, "microphone") == 0) {
             if (section != MICROPHONE_CHARACTERISTIC) {
                 ALOGE("microphone tag only supported with MICROPHONE_CHARACTERISTIC section");
@@ -1139,9 +1353,40 @@ static void start_tag(void *userdata __unused, const XML_Char *tag_name,
             section = CUSTOM_MTMX_PARAM_COEFFS;
             section_process_fn fn = section_table[section];
             fn(attr);
+        } else if (strcmp(tag_name, "external_specific_dev") == 0) {
+            section = EXTERNAL_DEVICE_SPECIFIC;
+        } else if (strcmp(tag_name, "ext_device") == 0) {
+            section_process_fn fn = section_table[section];
+            fn(attr);
+        } else if (strcmp(tag_name, "custom_mtmx_in_params") == 0) {
+            if (section != ROOT) {
+                ALOGE("custom_mtmx_in_params tag supported only in ROOT section");
+                return;
+            }
+            section = CUSTOM_MTMX_IN_PARAMS;
+            section_process_fn fn = section_table[section];
+            fn(attr);
+        } else if (strcmp(tag_name, "custom_mtmx_param_in_chs") == 0) {
+            if (section != CUSTOM_MTMX_IN_PARAMS) {
+                ALOGE("custom_mtmx_param_in_chs tag supported only with CUSTOM_MTMX_IN_PARAMS section");
+                return;
+            }
+            section = CUSTOM_MTMX_PARAM_IN_CH_INFO;
+            section_process_fn fn = section_table[section];
+            fn(attr);
         }
     } else {
-            ALOGE("%s: unknown caller!", __func__);
+        if(strcmp(tag_name, "config_params") == 0) {
+            section = CONFIG_PARAMS;
+        } else if (strcmp(tag_name, "param") == 0) {
+            if (section != CONFIG_PARAMS) {
+                ALOGE("param tag only supported with CONFIG_PARAMS section");
+                return;
+            }
+
+            section_process_fn fn = section_table[section];
+            fn(attr);
+        }
     }
     return;
 }
@@ -1164,12 +1409,13 @@ static void end_tag(void *userdata __unused, const XML_Char *tag_name)
         section = ROOT;
     } else if (strcmp(tag_name, "config_params") == 0) {
         section = ROOT;
-        if (my_data.caller == PLATFORM) {
-            platform_set_parameters(my_data.platform, my_data.kvpairs);
-        }
+    } else if (strcmp(tag_name, "operator_specific") == 0) {
+        section = ROOT;
     } else if (strcmp(tag_name, "interface_names") == 0) {
         section = ROOT;
     } else if (strcmp(tag_name, "gain_db_to_level_mapping") == 0) {
+        section = ROOT;
+    } else if (strcmp(tag_name, "app_types") == 0) {
         section = ROOT;
     } else if (strcmp(tag_name, "acdb_metainfo_key") == 0) {
         section = ROOT;
@@ -1177,16 +1423,20 @@ static void end_tag(void *userdata __unused, const XML_Char *tag_name)
         section = ROOT;
     } else if (strcmp(tag_name, "snd_devices") == 0) {
         section = ROOT;
+    } else if (strcmp(tag_name, "external_specific_dev") == 0) {
+        section = ROOT;
     } else if (strcmp(tag_name, "input_snd_device") == 0) {
         section = SND_DEVICES;
     } else if (strcmp(tag_name, "input_snd_device_mic_mapping") == 0) {
         section = INPUT_SND_DEVICE;
-    } else if (strcmp(tag_name, "device_names") == 0) {
-        section = ROOT;
     } else if (strcmp(tag_name, "custom_mtmx_params") == 0) {
         section = ROOT;
     } else if (strcmp(tag_name, "custom_mtmx_param_coeffs") == 0) {
         section = CUSTOM_MTMX_PARAMS;
+    } else if (strcmp(tag_name, "custom_mtmx_in_params") == 0) {
+        section = ROOT;
+    } else if (strcmp(tag_name, "custom_mtmx_param_in_chs") == 0) {
+        section = CUSTOM_MTMX_IN_PARAMS;
     }
 }
 
@@ -1197,13 +1447,24 @@ int platform_info_init(const char *filename, void *platform, caller_t caller_typ
     int             ret = 0;
     int             bytes_read;
     void            *buf;
+    char            platform_info_file_name[MIXER_PATH_MAX_LENGTH]= {0};
 
-    file = fopen(filename, "r");
+    pthread_mutex_lock(&parser_lock);
+    if (filename == NULL)
+        strlcpy(platform_info_file_name, PLATFORM_INFO_XML_PATH,
+                MIXER_PATH_MAX_LENGTH);
+    else
+        strlcpy(platform_info_file_name, filename, MIXER_PATH_MAX_LENGTH);
+
+    ALOGV("%s: platform info file name is %s", __func__,
+          platform_info_file_name);
+
+    file = fopen(platform_info_file_name, "r");
     section = ROOT;
 
     if (!file) {
         ALOGD("%s: Failed to open %s, using defaults.",
-            __func__, filename);
+            __func__, platform_info_file_name);
         ret = -ENODEV;
         goto done;
     }
@@ -1239,7 +1500,7 @@ int platform_info_init(const char *filename, void *platform, caller_t caller_typ
         if (XML_ParseBuffer(parser, bytes_read,
                             bytes_read == 0) == XML_STATUS_ERROR) {
             ALOGE("%s: XML_ParseBuffer failed, for %s",
-                __func__, filename);
+                __func__, platform_info_file_name);
             ret = -EINVAL;
             goto err_free_parser;
         }
@@ -1253,5 +1514,6 @@ err_free_parser:
 err_close_file:
     fclose(file);
 done:
+    pthread_mutex_unlock(&parser_lock);
     return ret;
 }

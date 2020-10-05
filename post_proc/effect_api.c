@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013-2015, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2013-2015, 2019 The Linux Foundation. All rights reserved.
 
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions are
@@ -56,7 +56,7 @@
 
 #include <stdbool.h>
 #include <errno.h>
-#include <cutils/log.h>
+#include <log/log.h>
 #include <tinyalsa/asoundlib.h>
 #include <sound/audio_effects.h>
 #include <sound/devdep_params.h>
@@ -264,7 +264,10 @@ static int pbe_send_params(eff_mode_t mode, void *ctl,
 {
     long  param_values[128] = {0};
     long *p_param_values = param_values;
-    int i, *cfg = NULL;
+    int i;
+    int32_t *p_coeffs = NULL;
+    uint32_t lpf_len = 0, hpf_len = 0, bpf_len = 0;
+    uint32_t bsf_len = 0, tsf_len = 0, total_coeffs_len = 0;
 
     ALOGV("%s: enabled=%d", __func__, pbe->enable_flag);
     *p_param_values++ = PBE_MODULE;
@@ -283,9 +286,42 @@ static int pbe_send_params(eff_mode_t mode, void *ctl,
         *p_param_values++ = CONFIG_SET;
         *p_param_values++ = 0; /* start offset if param size if greater than 128  */
         *p_param_values++ = pbe->cfg_len;
-        cfg = (int *)&pbe->config;
-        for (i = 0; i < (int)pbe->cfg_len ; i+= sizeof(*p_param_values))
-            *p_param_values++ = *cfg++;
+        *p_param_values++ = pbe->config.real_bass_mix;
+        *p_param_values++ = pbe->config.bass_color_control;
+        *p_param_values++ = pbe->config.main_chain_delay;
+        *p_param_values++ = pbe->config.xover_filter_order;
+        *p_param_values++ = pbe->config.bandpass_filter_order;
+        *p_param_values++ = pbe->config.drc_delay;
+        *p_param_values++ = pbe->config.rms_tav;
+        *p_param_values++ = pbe->config.exp_threshold;
+        *p_param_values++ = pbe->config.exp_slope;
+        *p_param_values++ = pbe->config.comp_threshold;
+        *p_param_values++ = pbe->config.comp_slope;
+        *p_param_values++ = pbe->config.makeup_gain;
+        *p_param_values++ = pbe->config.comp_attack;
+        *p_param_values++ = pbe->config.comp_release;
+        *p_param_values++ = pbe->config.exp_attack;
+        *p_param_values++ = pbe->config.exp_release;
+        *p_param_values++ = pbe->config.limiter_bass_threshold;
+        *p_param_values++ = pbe->config.limiter_high_threshold;
+        *p_param_values++ = pbe->config.limiter_bass_makeup_gain;
+        *p_param_values++ = pbe->config.limiter_high_makeup_gain;
+        *p_param_values++ = pbe->config.limiter_bass_gc;
+        *p_param_values++ = pbe->config.limiter_high_gc;
+        *p_param_values++ = pbe->config.limiter_delay;
+        *p_param_values++ = pbe->config.reserved;
+
+        p_coeffs = &pbe->config.p1LowPassCoeffs[0];
+        lpf_len = (pbe->config.xover_filter_order == 3) ? 10 : 5;
+        hpf_len = (pbe->config.xover_filter_order == 3) ? 10 : 5;
+        bpf_len = pbe->config.bandpass_filter_order * 5;
+        bsf_len = 5;
+        tsf_len = 5;
+        total_coeffs_len = lpf_len + hpf_len + bpf_len + bsf_len + tsf_len;
+
+        for (i = 0; i < total_coeffs_len; i++) {
+            *p_param_values++ = *p_coeffs++;
+        }
         param_values[2] += 1;
     }
 
@@ -533,7 +569,7 @@ static int eq_send_params(eff_mode_t mode, void *ctl, struct eq_params *eq,
         for (i=0; i<eq->config.num_bands; i++) {
             *p_param_values++ = eq->per_band_cfg[i].band_idx;
             *p_param_values++ = eq->per_band_cfg[i].filter_type;
-	    *p_param_values++ = eq->per_band_cfg[i].freq_millihertz;
+            *p_param_values++ = eq->per_band_cfg[i].freq_millihertz;
             *p_param_values++ = eq->per_band_cfg[i].gain_millibels;
             *p_param_values++ = eq->per_band_cfg[i].quality_factor;
         }
@@ -860,7 +896,6 @@ int offload_soft_volume_send_params(struct mixer_ctl *ctl,
 {
     long param_values[128] = {0};
     long *p_param_values = param_values;
-    uint32_t i;
 
     ALOGV("%s", __func__);
     *p_param_values++ = SOFT_VOLUME_MODULE;
@@ -926,7 +961,6 @@ int offload_transition_soft_volume_send_params(struct mixer_ctl *ctl,
 {
     long param_values[128] = {0};
     long *p_param_values = param_values;
-    uint32_t i;
 
     ALOGV("%s", __func__);
     *p_param_values++ = SOFT_VOLUME2_MODULE;
@@ -969,7 +1003,6 @@ static int hpx_send_params(eff_mode_t mode, void *ctl,
 {
     long param_values[128] = {0};
     long *p_param_values = param_values;
-    uint32_t i;
 
     ALOGV("%s", __func__);
     if (!ctl) {

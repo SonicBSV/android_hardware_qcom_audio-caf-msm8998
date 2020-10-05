@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013-2018, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2013-2019, The Linux Foundation. All rights reserved.
  * Not a contribution.
  *
  * Copyright (C) 2013 The Android Open Source Project
@@ -24,9 +24,9 @@
 #include <errno.h>
 #include <stdlib.h>
 #include <math.h>
-#include <cutils/log.h>
+#include <log/log.h>
 #include <cutils/str_parms.h>
-
+#include <cutils/properties.h>
 #include "audio_hw.h"
 #include "voice.h"
 #include "voice_extn/voice_extn.h"
@@ -47,6 +47,54 @@ struct pcm_config pcm_config_voice_call = {
     .period_count = 2,
     .format = PCM_FORMAT_S16_LE,
 };
+
+struct pcm *voice_loopback_tx = NULL;
+struct pcm *voice_loopback_rx = NULL;
+
+static bool voice_external_baseband_supported(struct audio_device *adev)
+{
+    /* If platform is apq8084 and baseband is MDM, load CSD Client specific
+     * symbols. Voice call is handled by MDM and apps processor talks to
+     * MDM through CSD Client
+     */
+    char *snd_card_name = NULL;
+    char baseband[100];
+    snd_card_name = strdup(mixer_get_name(adev->mixer));
+    if (!snd_card_name)
+        return 0;
+    property_get("ro.baseband", baseband, "");
+    if (((!strncmp("hana55", snd_card_name, sizeof("hana55"))) &&
+        ( !strncmp("mdm", baseband, (sizeof("mdm")-1)) ||
+          !strncmp("sdx", baseband, (sizeof("sdx")-1)))) ||
+        ((!strncmp("sm8150-pcie-snd-card", snd_card_name, sizeof("sm8150-pcie-snd-card"))) &&
+        ( !strncmp("mdm", baseband, (sizeof("mdm")-1)) ||
+          !strncmp("sdx", baseband, (sizeof("sdx")-1))))) {
+         return 1;
+    } else {
+         return 0;
+    }
+}
+
+static bool voice_update_pcm_config(struct audio_device *adev)
+{
+    /* If platform is apq8084 and baseband is MDM, load CSD Client specific
+     * symbols. Voice call is handled by MDM and apps processor talks to
+     * MDM through CSD Client
+     */
+    char *snd_card_name = NULL;
+    char baseband[100];
+    snd_card_name = strdup(mixer_get_name(adev->mixer));
+    if (!snd_card_name)
+        return 0;
+    property_get("ro.baseband", baseband, "");
+    if ((!strncmp("sm8150-pcie-snd-card", snd_card_name, sizeof("sm8150-pcie-snd-card"))) &&
+        ( !strncmp("mdm", baseband, (sizeof("mdm")-1)) ||
+          !strncmp("sdx", baseband, (sizeof("sdx")-1)))) {
+         return 1;
+    } else {
+         return 0;
+    }
+}
 
 static struct voice_session *voice_get_session_from_use_case(struct audio_device *adev,
                               audio_usecase_t usecase_id)
@@ -73,15 +121,20 @@ static bool voice_is_sidetone_device(snd_device_t out_device,
         strlcpy(mixer_path, "sidetone-handset", MIXER_PATH_MAX_LENGTH);
         break;
     case SND_DEVICE_OUT_VOICE_HEADPHONES:
+    case SND_DEVICE_OUT_VOICE_HEADSET:
     case SND_DEVICE_OUT_VOICE_ANC_HEADSET:
     case SND_DEVICE_OUT_VOICE_ANC_FB_HEADSET:
         is_sidetone_dev = true;
         strlcpy(mixer_path, "sidetone-headphones", MIXER_PATH_MAX_LENGTH);
         break;
+    case SND_DEVICE_OUT_VOICE_USB_HEADSET:
     case SND_DEVICE_OUT_USB_HEADSET:
+        // USB does not use a QC mixer.
+        mixer_path[0] = '\0';
         is_sidetone_dev = true;
         break;
     default:
+        ALOGW("%s: %d is not a sidetone device", __func__, out_device);
         is_sidetone_dev = false;
         break;
     }
@@ -177,6 +230,16 @@ int voice_stop_usecase(struct audio_device *adev, audio_usecase_t usecase_id)
         session->pcm_tx = NULL;
     }
 
+    if (voice_external_baseband_supported(adev)) {
+        if(voice_loopback_rx) {
+           pcm_close(voice_loopback_rx);
+           voice_loopback_rx = NULL;
+       }
+       if(voice_loopback_tx) {
+          pcm_close(voice_loopback_tx);
+          voice_loopback_tx = NULL;
+       }
+    }
     /* 2. Get and set stream specific mixer controls */
     disable_audio_route(adev, uc_info);
 
@@ -196,6 +259,7 @@ int voice_start_usecase(struct audio_device *adev, audio_usecase_t usecase_id)
     int ret = 0;
     struct audio_usecase *uc_info;
     int pcm_dev_rx_id, pcm_dev_tx_id;
+    int pcm_dev_loopback_rx_id, pcm_dev_loopback_tx_id;
     uint32_t sample_rate = 8000;
     struct voice_session *session = NULL;
     struct pcm_config voice_config = pcm_config_voice_call;
@@ -219,6 +283,11 @@ int voice_start_usecase(struct audio_device *adev, audio_usecase_t usecase_id)
     uc_info->stream.out = adev->current_call_output;
     uc_info->devices = adev->current_call_output->devices;
 
+    if (voice_update_pcm_config(adev)) {
+        sample_rate = 48000;
+        voice_config.rate = 48000;
+    }
+
     if (popcount(uc_info->devices) == 2) {
         ALOGE("%s: Invalid combo device(%#x) for voice call", __func__,
               uc_info->devices);
@@ -240,6 +309,16 @@ int voice_start_usecase(struct audio_device *adev, audio_usecase_t usecase_id)
     list_add_tail(&adev->usecase_list, &uc_info->list);
 
     select_devices(adev, usecase_id);
+
+    if (voice_external_baseband_supported(adev)) {
+        pcm_dev_loopback_rx_id = HOST_LESS_RX_ID;
+        pcm_dev_loopback_tx_id = HOST_LESS_TX_ID;
+    }
+
+    if (voice_update_pcm_config(adev)) {
+        pcm_dev_loopback_rx_id = PCIE_HOST_LESS_RX_ID;
+        pcm_dev_loopback_tx_id = PCIE_HOST_LESS_TX_ID;
+    }
 
     pcm_dev_rx_id = platform_get_pcm_device_id(uc_info->id, PCM_PLAYBACK);
     pcm_dev_tx_id = platform_get_pcm_device_id(uc_info->id, PCM_CAPTURE);
@@ -282,11 +361,56 @@ int voice_start_usecase(struct audio_device *adev, audio_usecase_t usecase_id)
         goto error_start_voice;
     }
 
-    if(adev->mic_break_enabled)
+    if (voice_external_baseband_supported(adev)) {
+        voice_loopback_rx = pcm_open(adev->snd_card,
+                                 pcm_dev_loopback_rx_id,
+                                 PCM_OUT, &voice_config);
+        if (voice_loopback_rx < 0 || !pcm_is_ready(voice_loopback_rx)) {
+            ALOGE("%s: Either could not open pcm_dev_loopback_rx_id %d or %s",
+                  __func__, pcm_dev_loopback_rx_id, pcm_get_error(voice_loopback_rx));
+            ret = -EIO;
+            goto error_start_voice;
+        }
+
+        voice_loopback_tx = pcm_open(adev->snd_card,
+                                 pcm_dev_loopback_tx_id,
+                                 PCM_IN, &voice_config);
+        if (voice_loopback_tx < 0 || !pcm_is_ready(voice_loopback_tx)) {
+                 ALOGE("%s: Either could not open pcm_dev_loopback_tx_id %d or %s",
+                   __func__, pcm_dev_loopback_tx_id, pcm_get_error(voice_loopback_tx));
+             ret = -EIO;
+             goto error_start_voice;
+        }
+    }
+
+    if (adev->mic_break_enabled)
         platform_set_mic_break_det(adev->platform, true);
 
-    pcm_start(session->pcm_tx);
-    pcm_start(session->pcm_rx);
+    ret = pcm_start(session->pcm_tx);
+    if (ret != 0) {
+        ALOGE("%s: %s", __func__, pcm_get_error(session->pcm_tx));
+        goto error_start_voice;
+    }
+
+    ret = pcm_start(session->pcm_rx);
+    if (ret != 0) {
+        ALOGE("%s: %s", __func__, pcm_get_error(session->pcm_rx));
+        goto error_start_voice;
+    }
+
+    if (voice_external_baseband_supported(adev)) {
+        ret = pcm_start(voice_loopback_tx);
+        if (ret != 0) {
+            ALOGE("%s: %s", __func__, pcm_get_error(voice_loopback_tx));
+            goto error_start_voice;
+        }
+
+        ret = pcm_start(voice_loopback_rx);
+        if (ret != 0) {
+            ALOGE("%s: %s", __func__, pcm_get_error(voice_loopback_rx));
+            goto error_start_voice;
+        }
+    }
 
     /* Enable aanc only when no calls are active */
     if (!voice_is_call_state_active(adev))
@@ -363,6 +487,22 @@ uint32_t voice_get_active_session_id(struct audio_device *adev)
     return session_id;
 }
 
+bool voice_check_voicecall_usecases_active(struct audio_device *adev)
+{
+    struct listnode *node;
+    struct audio_usecase *usecase = NULL;
+
+    list_for_each(node, &adev->usecase_list) {
+        usecase = node_to_item(node, struct audio_usecase, list);
+        if (usecase->type == VOICE_CALL) {
+            ALOGV("%s: voice usecase:%s is active", __func__,
+                   use_case_table[usecase->id]);
+            return true;
+        }
+    }
+    return false;
+}
+
 int voice_check_and_set_incall_rec_usecase(struct audio_device *adev,
                                            struct stream_in *in)
 {
@@ -405,6 +545,8 @@ int voice_check_and_set_incall_rec_usecase(struct audio_device *adev,
         session_id = voice_get_active_session_id(adev);
         ret = platform_set_incall_recording_session_id(adev->platform,
                                                        session_id, rec_mode);
+        platform_set_incall_recording_session_channels(adev->platform,
+                                                       in->config.channels);
         ALOGV("%s: Update usecase to %d",__func__, in->usecase);
     } else {
         /*
@@ -443,6 +585,11 @@ int voice_check_and_stop_incall_rec_usecase(struct audio_device *adev,
 snd_device_t voice_get_incall_rec_backend_device(struct stream_in *in)
 {
    snd_device_t incall_record_device = {0};
+
+    if (!in) {
+       ALOGE("%s: input stream is NULL", __func__);
+       return 0;
+    }
 
    switch(in->source) {
     case AUDIO_SOURCE_VOICE_UPLINK:
@@ -503,7 +650,7 @@ int voice_set_mic_mute(struct audio_device *adev, bool state)
     adev->voice.mic_mute = state;
 
     if (audio_extn_hfp_is_active(adev)) {
-        err = hfp_set_mic_mute(adev, state);
+        err = audio_extn_hfp_set_mic_mute2(adev, state);
     } else if (adev->mode == AUDIO_MODE_IN_CALL) {
        /* Use device mute if incall music delivery usecase is in progress */
         if (adev->voice.use_device_mute)
@@ -578,6 +725,9 @@ int voice_start_call(struct audio_device *adev)
     int ret = 0;
 
     adev->voice.in_call = true;
+
+    voice_set_mic_mute(adev, adev->voice.mic_mute);
+
     ret = voice_extn_start_call(adev);
     if (ret == -ENOSYS) {
         ret = voice_start_usecase(adev, USECASE_VOICE_CALL);
@@ -655,6 +805,20 @@ int voice_set_parameters(struct audio_device *adev, struct str_parms *parms)
         }
     }
 
+    err = str_parms_get_str(parms, AUDIO_PARAMETER_KEY_HAC,
+                            value, sizeof(value));
+    if (err >= 0) {
+        bool hac = false;
+        str_parms_del(parms, AUDIO_PARAMETER_KEY_HAC);
+        if (strcmp(value, AUDIO_PARAMETER_VALUE_HAC_ON) == 0)
+            hac = true;
+
+        if (hac != adev->voice.hac) {
+            adev->voice.hac = hac;
+            if (voice_is_in_call(adev))
+                voice_update_devices_for_all_voice_usecases(adev);
+        }
+    }
     err = str_parms_get_str(parms, AUDIO_PARAMETER_KEY_INCALLMUSIC,
                             value, sizeof(value));
     if (err >= 0) {
@@ -674,13 +838,18 @@ done:
 void voice_init(struct audio_device *adev)
 {
     int i = 0;
+    int max_voice_sessions = MAX_VOICE_SESSIONS;
+
+    if (!voice_extn_is_multi_session_supported())
+        max_voice_sessions = 1;
 
     memset(&adev->voice, 0, sizeof(adev->voice));
     adev->voice.tty_mode = TTY_MODE_OFF;
+    adev->voice.hac = false;
     adev->voice.volume = 1.0f;
     adev->voice.mic_mute = false;
     adev->voice.in_call = false;
-    for (i = 0; i < MAX_VOICE_SESSIONS; i++) {
+    for (i = 0; i < max_voice_sessions; i++) {
         adev->voice.session[i].pcm_rx = NULL;
         adev->voice.session[i].pcm_tx = NULL;
         adev->voice.session[i].state.current = CALL_INACTIVE;
@@ -706,5 +875,6 @@ void voice_update_devices_for_all_voice_usecases(struct audio_device *adev)
         }
     }
 }
+
 
 

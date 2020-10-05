@@ -34,9 +34,9 @@
 #include <stdbool.h>
 #include <stdlib.h>
 #include <dlfcn.h>
-#include <cutils/log.h>
-#include <unistd.h>
 #include <pthread.h>
+#include <log/log.h>
+#include <unistd.h>
 #include "audio_hw.h"
 #include "audio_extn.h"
 #include "platform.h"
@@ -85,7 +85,8 @@ typedef enum {
     AUDIO_EVENT_CAPTURE_STREAM_ACTIVE,
     AUDIO_EVENT_BATTERY_STATUS_CHANGED,
     AUDIO_EVENT_GET_PARAM,
-    AUDIO_EVENT_UPDATE_ECHO_REF
+    AUDIO_EVENT_UPDATE_ECHO_REF,
+    AUDIO_EVENT_SCREEN_STATUS_CHANGED
 } audio_event_type_t;
 
 typedef enum {
@@ -99,7 +100,9 @@ typedef enum {
     SND_CARD_STATUS_OFFLINE,
     SND_CARD_STATUS_ONLINE,
     CPE_STATUS_OFFLINE,
-    CPE_STATUS_ONLINE
+    CPE_STATUS_ONLINE,
+    SLPI_STATUS_OFFLINE,
+    SLPI_STATUS_ONLINE
 } ssr_event_status_t;
 
 struct sound_trigger_session_info {
@@ -134,7 +137,6 @@ struct sound_trigger_get_param_data {
     int sm_handle;
     struct str_parms *reply;
 };
-
 
 struct audio_event_info {
     union {
@@ -183,7 +185,6 @@ do {\
 
 #define SVA_PARAM_DIRECTION_OF_ARRIVAL "st_direction_of_arrival"
 #define SVA_PARAM_CHANNEL_INDEX "st_channel_index"
-
 #define MAX_STR_LENGTH_FFV_PARAMS 30
 #define MAX_FFV_SESSION_ID 100
 /*
@@ -273,10 +274,42 @@ static int populate_usecase(struct audio_hal_usecase *usecase,
 
 static void stdev_snd_mon_cb(void * stream __unused, struct str_parms * parms)
 {
+    audio_event_info_t event;
+    char value[32];
+    int ret = 0;
+
     if (!parms)
         return;
 
-    audio_extn_sound_trigger_set_parameters(NULL, parms);
+    ret = str_parms_get_str(parms, "SND_CARD_STATUS", value,
+                            sizeof(value));
+    if (ret > 0) {
+        if (strstr(value, "OFFLINE")) {
+            event.u.status = SND_CARD_STATUS_OFFLINE;
+            st_dev->st_callback(AUDIO_EVENT_SSR, &event);
+        }
+        else if (strstr(value, "ONLINE")) {
+            event.u.status = SND_CARD_STATUS_ONLINE;
+            st_dev->st_callback(AUDIO_EVENT_SSR, &event);
+        }
+        else
+            ALOGE("%s: unknown snd_card_status", __func__);
+    }
+
+    ret = str_parms_get_str(parms, "CPE_STATUS", value, sizeof(value));
+    if (ret > 0) {
+        if (strstr(value, "OFFLINE")) {
+            event.u.status = CPE_STATUS_OFFLINE;
+            st_dev->st_callback(AUDIO_EVENT_SSR, &event);
+        }
+        else if (strstr(value, "ONLINE")) {
+            event.u.status = CPE_STATUS_ONLINE;
+            st_dev->st_callback(AUDIO_EVENT_SSR, &event);
+        }
+        else
+            ALOGE("%s: unknown CPE status", __func__);
+    }
+
     return;
 }
 
@@ -373,8 +406,6 @@ int audio_extn_sound_trigger_read(struct stream_in *in, void *buffer,
         ALOGE(" %s: Sound trigger is not active", __func__);
         goto exit;
     }
-    if(in->standby)
-        in->standby = false;
 
     pthread_mutex_lock(&st_dev->lock);
     st_info = get_sound_trigger_info(in->capture_handle);
@@ -442,6 +473,21 @@ void audio_extn_sound_trigger_check_and_get_session(struct stream_in *in)
     pthread_mutex_unlock(&st_dev->lock);
 }
 
+bool is_same_as_st_device(snd_device_t snd_device)
+{
+    if (snd_device == SND_DEVICE_IN_HANDSET_MIC_AEC ||
+        snd_device == SND_DEVICE_IN_HANDSET_MIC ||
+        snd_device == SND_DEVICE_IN_HANDSET_MIC_AEC_NS ||
+        snd_device == SND_DEVICE_IN_SPEAKER_MIC ||
+        snd_device == SND_DEVICE_IN_VOICE_SPEAKER_MIC ||
+        snd_device == SND_DEVICE_IN_SPEAKER_MIC_AEC ||
+        snd_device == SND_DEVICE_IN_SPEAKER_MIC_AEC_NS ||
+        snd_device == SND_DEVICE_IN_SPEAKER_MIC_NS) {
+        ALOGD("audio HAL using same device %d as ST", snd_device);
+        return true;
+    }
+    return false;
+}
 
 bool audio_extn_sound_trigger_check_ec_ref_enable()
 {
@@ -539,6 +585,14 @@ void audio_extn_sound_trigger_update_stream_status(struct audio_usecase *uc_info
         (uc_info->type != PCM_PLAYBACK))
         return;
 
+    if ((uc_info->in_snd_device >= SND_DEVICE_IN_BEGIN &&
+        uc_info->in_snd_device < SND_DEVICE_IN_END)) {
+        if (is_same_as_st_device(uc_info->in_snd_device))
+            ev_info.device_info.device = ST_DEVICE_HANDSET_MIC;
+    } else {
+        ALOGE("%s: invalid input device 0x%x, for event %d",
+                    __func__, uc_info->in_snd_device, event);
+    }
     raise_event = platform_sound_trigger_usecase_needs_event(uc_info->id);
     ALOGD("%s: uc_info->id %d of type %d for Event %d, with Raise=%d",
         __func__, uc_info->id, uc_info->type, event, raise_event);
@@ -584,6 +638,17 @@ void audio_extn_sound_trigger_update_battery_status(bool charging)
     st_dev->st_callback(AUDIO_EVENT_BATTERY_STATUS_CHANGED, &ev_info);
 }
 
+void audio_extn_sound_trigger_update_screen_status(bool screen_off)
+{
+    struct audio_event_info ev_info = {{0}, {0}};
+
+    if (!st_dev)
+        return;
+
+    ev_info.u.value = screen_off;
+    st_dev->st_callback(AUDIO_EVENT_SCREEN_STATUS_CHANGED, &ev_info);
+}
+
 
 void audio_extn_sound_trigger_set_parameters(struct audio_device *adev __unused,
                                struct str_parms *params)
@@ -597,34 +662,7 @@ void audio_extn_sound_trigger_set_parameters(struct audio_device *adev __unused,
         return;
     }
 
-    ret = str_parms_get_str(params, "SND_CARD_STATUS", value,
-                            sizeof(value));
-    if (ret > 0) {
-        if (strstr(value, "OFFLINE")) {
-            event.u.status = SND_CARD_STATUS_OFFLINE;
-            st_dev->st_callback(AUDIO_EVENT_SSR, &event);
-        }
-        else if (strstr(value, "ONLINE")) {
-            event.u.status = SND_CARD_STATUS_ONLINE;
-            st_dev->st_callback(AUDIO_EVENT_SSR, &event);
-        }
-        else
-            ALOGE("%s: unknown snd_card_status", __func__);
-    }
-
-    ret = str_parms_get_str(params, "CPE_STATUS", value, sizeof(value));
-    if (ret > 0) {
-        if (strstr(value, "OFFLINE")) {
-            event.u.status = CPE_STATUS_OFFLINE;
-            st_dev->st_callback(AUDIO_EVENT_SSR, &event);
-        }
-        else if (strstr(value, "ONLINE")) {
-            event.u.status = CPE_STATUS_ONLINE;
-            st_dev->st_callback(AUDIO_EVENT_SSR, &event);
-        }
-        else
-            ALOGE("%s: unknown CPE status", __func__);
-    }
+    stdev_snd_mon_cb(NULL, params);
 
     ret = str_parms_get_int(params, "SVA_NUM_SESSIONS", &val);
     if (ret >= 0) {
@@ -641,7 +679,7 @@ void audio_extn_sound_trigger_set_parameters(struct audio_device *adev __unused,
 
     ret = str_parms_get_int(params, AUDIO_PARAMETER_DEVICE_DISCONNECT, &val);
     if ((ret >= 0) && (audio_is_input_device(val) ||
-           (val == AUDIO_DEVICE_OUT_LINE))) {
+            (val == AUDIO_DEVICE_OUT_LINE))) {
         event.u.value = val;
         st_dev->st_callback(AUDIO_EVENT_DEVICE_DISCONNECT, &event);
     }
@@ -650,6 +688,18 @@ void audio_extn_sound_trigger_set_parameters(struct audio_device *adev __unused,
     if (ret >= 0) {
         strlcpy(event.u.str_value, value, sizeof(event.u.str_value));
         st_dev->st_callback(AUDIO_EVENT_SVA_EXEC_MODE, &event);
+    }
+
+    ret = str_parms_get_str(params, "SLPI_STATUS", value, sizeof(value));
+    if (ret > 0) {
+        if (strstr(value, "OFFLINE")) {
+            event.u.status = SLPI_STATUS_OFFLINE;
+            st_dev->st_callback(AUDIO_EVENT_SSR, &event);
+        } else if (strstr(value, "ONLINE")) {
+            event.u.status = SLPI_STATUS_ONLINE;
+            st_dev->st_callback(AUDIO_EVENT_SSR, &event);
+        } else
+            ALOGE("%s: unknown SLPI status", __func__);
     }
 }
 
@@ -662,7 +712,7 @@ static int extract_sm_handle(const char *keys, char *paramstr) {
         goto exit;
 
     inputstr = strdup(keys);
-    token =strtok_r(inputstr,":",&tmpstr);
+    token =strtok_r(inputstr,":", &tmpstr);
 
     if (token == NULL)
         goto exit;
@@ -716,7 +766,6 @@ void audio_extn_sound_trigger_get_parameters(const struct audio_device *adev __u
         event.u.st_get_param_data.reply = reply;
         st_dev->st_callback(AUDIO_EVENT_GET_PARAM, &event);
     }
-
 }
 
 int audio_extn_sound_trigger_init(struct audio_device *adev)
@@ -755,7 +804,9 @@ int audio_extn_sound_trigger_init(struct audio_device *adev)
         st_dev->sthal_prop_api_version = 0;
         status  = 0; /* passthru for backward compability */
     } else {
-        st_dev->sthal_prop_api_version = *(int*)sthal_prop_api_version;
+        if (sthal_prop_api_version != NULL) {
+            st_dev->sthal_prop_api_version = *(int*)sthal_prop_api_version;
+        }
         if (MAJOR_VERSION(st_dev->sthal_prop_api_version) !=
             MAJOR_VERSION(STHAL_PROP_API_CURRENT_VERSION)) {
             ALOGE("%s: Incompatible API versions ahal:0x%x != sthal:0x%x",
@@ -770,9 +821,8 @@ int audio_extn_sound_trigger_init(struct audio_device *adev)
     st_dev->adev = adev;
     st_dev->st_ec_ref_enabled = false;
     list_init(&st_dev->st_ses_list);
-#ifdef SND_MONITOR_ENABLED
     audio_extn_snd_mon_register_listener(st_dev, stdev_snd_mon_cb);
-#endif
+
     return 0;
 
 cleanup:
